@@ -7,6 +7,7 @@
     ****DATE***** | ****NAME**** | ****DESCRIPTION****
      2024-04-06   |  R. Nelson   | Initial version to replace Arduino IDE code   
      2024-04-20   |  R. Nelson   | Bug fixes and code cleanup - Tested and working
+     2024-10-11   |  R. Nelson   | Added WIFI and MQTT reconnect logic
 */
 
 // Includes
@@ -49,6 +50,9 @@ void allonehue (CRGB thehue);
 void fadeall();
 void looper (CRGB themainhue);
 void wifiSetup();
+void checkWiFi();
+void checkMQTT();
+void updateLEDs();
 
 
 
@@ -71,8 +75,21 @@ const char* mqttServerIP = "10.1.10.55";
 const char DeviceTopic[] = "ToDevice/Sterilizer";
 const char hostTopic[] = "ToHost/Sterilizer";
 const char* deviceID = "Sterilizer";
+const unsigned long wifiTimeout = 120000; // 2 minutes
+const unsigned long mqttTimeout = 120000; // 2 minutes
 
+bool wifiTimedOut = false;
+bool mqttTimedOut = false;
+bool wifiConnected = false;
+bool mqttConnected = false;
 
+// Add these state variables to track the previous connection status
+bool previousWifiStatus = false;
+bool previousMqttStatus = false;
+
+// Timers for reconnection attempts
+unsigned long lastWiFiAttempt = 0;
+unsigned long lastMQTTAttempt = 0;
 
 // Global Variables
 long lastMsgTime = 0; // The time (from millis()) when the last MQTT message was received
@@ -87,54 +104,73 @@ PuzzleState puzzle = Initializing;
 
 
 // WiFi and MQTT Functions
-void wifiSetup(){
-  Serial.println();
-  Serial.println("****************************");
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
+void wifiSetup() {
+  Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, pass);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-
-  Serial.println("");
-  Serial.print("WiFi connected");
+  Serial.println("\nWiFi connected");
   Serial.print("IP Address: ");
-  Serial.print(WiFi.localIP());
+  Serial.println(WiFi.localIP());
 }
 
 void mqttSetup() {
   MQTTclient.setServer(mqttServerIP, 1883);
   MQTTclient.setCallback(mqttCallback);
-  MQTTclient.subscribe(DeviceTopic);
   while (!MQTTclient.connected()) {
-
-    // Debug info
-    Serial.println("Attempting to connect to the MQTT broker at ");
-    Serial.println(mqttServerIP);
-    delay(500); // Slow down the output
-
-    // Attempt to connect
+    Serial.println("Connecting to MQTT broker...");
     if (MQTTclient.connect(deviceID)) {
-
-      // Debug info
       Serial.println("Connected to MQTT broker");
-
-      // Once connected, publish an announcement to the host
-      MQTTclient.publish(hostTopic, "Sterilizer Connected!");
-      // Subscribe to topics meant for this device
       MQTTclient.subscribe(DeviceTopic);
-      Serial.println("Subscribed to topic: ");
-      Serial.println(DeviceTopic);
-      } else {
-      // Debug info
-      Serial.print("Failed to connect to MQTT broker, rc = ");
-      Serial.print(MQTTclient.state());
-      Serial.println("Retrying in 5 seconds...");
-      // Wait 5 seconds before retrying
-      delay(500);
+    } else {
+      Serial.print("MQTT connection failed, state=");
+      Serial.println(MQTTclient.state());
+      delay(5000);
     }
+  }
+}
+
+void updateLEDs()
+{
+  // Check if the current status has changed from the previous status
+  if (wifiConnected != previousWifiStatus || mqttConnected != previousMqttStatus)
+  {
+    // Update the LEDs based on the current connection status
+    if (!wifiConnected)
+    {
+      allonehue(CRGB::Purple); // Purple indicates no WiFi
+    }
+    else if (!mqttConnected)
+    {
+      allonehue(CRGB::Blue); // Blue indicates WiFi is connected but MQTT is not
+    }
+    else
+    {
+      allonehue(CRGB::Red); // Red indicates both WiFi and MQTT are connected
+    }
+
+    // Update the previous status variables
+    previousWifiStatus = wifiConnected;
+    previousMqttStatus = mqttConnected;
+  }
+}
+
+void mqttLoop() {
+  if (!MQTTclient.connected()) {
+    mqttConnected = false;
+    if (millis() - lastMQTTAttempt >= mqttTimeout) {
+      mqttTimedOut = true;
+      Serial.println("MQTT reconnection timed out.");
+      return;
+    }
+    mqttSetup();
+    lastMQTTAttempt = millis(); // Update last MQTT attempt time
+  } else {
+    mqttConnected = true;
+    mqttTimedOut = false;
+    MQTTclient.loop();
   }
 }
 
@@ -154,16 +190,32 @@ void mqttCallback(char* thisTopic, byte* message, unsigned int length) {
   }
 
   // Act upon the message received
-  if (strcasecmp(messageArrived, "Solve") == 0) {
+  if (strcasecmp(messageArrived, "solve") == 0) {
     onSolve();
   }
-  else if (strcasecmp(messageArrived, "Reset") == 0) {
+  else if (strcasecmp(messageArrived, "reset") == 0) {
     onReset();
   }
   else {
     Serial.print("Message Received: ");
     Serial.println(messageArrived);
     Serial.println(); 
+  }
+}
+
+void checkWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    if (millis() - lastWiFiAttempt >= wifiTimeout) {
+      wifiTimedOut = true;
+      Serial.println("WiFi reconnection timed out.");
+      return;
+    }
+    WiFi.reconnect();
+    lastWiFiAttempt = millis();
+  } else {
+    wifiConnected = true;
+    wifiTimedOut = false;
   }
 }
 
@@ -216,6 +268,10 @@ void setup() {
 }
 
 void loop() {
+  checkWiFi();
+  mqttLoop();
+  updateLEDs();
+
   // Switch action based on the current state of the puzzle
   switch(puzzle) {
     {
@@ -225,15 +281,10 @@ void loop() {
     }
     case Running:
     {
-      int sensorVal = digitalRead(Rotary);
-      //Serial.println(sensorVal);
-      // Read the Rotary switches for change
-      if (sensorVal == LOW) {
+      if (digitalRead(Rotary) == LOW) {
         onSolve();
         Serial.print(F("Sterilizer Solved!"));
       }
-      // Call the MQTT loop
-      MQTTclient.loop();
       break;
     }
 
@@ -244,9 +295,7 @@ void loop() {
     digitalWrite(MagLock, HIGH);
     digitalWrite(Pump, LOW);
     digitalWrite(Flames, LOW);
-    // Call the MQTT loop
-    MQTTclient.loop();// put your main code here, to run repeatedly:
-    break; // Add break statement here
+    break; 
     }
   }
 }
